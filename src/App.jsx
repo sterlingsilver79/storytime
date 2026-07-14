@@ -3,41 +3,52 @@ import { anthropic } from "./api";
 import { storage } from "./storage";
 
 /*
-  Story + Learning companion (plain look).
-  Behavior lives in SYSTEM_PROMPT. Memory persists via a shared database (see src/storage.js)
-  under the key "learningProfile" (concepts learned, words corrected, past stories).
-
-  Design choice you can change: a checkpoint unlocks the next part once he
-  ANSWERS it (right or wrong, with the correct answer always shown). Say the
-  word if you'd rather it require the correct answer before moving on.
+  Chat companion (plain look). It answers questions, chats normally, and writes
+  stories when he asks or shares a drawing — not everything is a story.
+  Behavior lives in SYSTEM_PROMPT. Memory persists via a shared database
+  (see src/storage.js) under "learningProfile".
 */
 
-const SYSTEM_PROMPT = `You run an interactive story-and-learning session for Sterling, age 11. He is sharp and dislikes being talked down to, and he struggles with spelling. Teach real things through the story.
+const SYSTEM_PROMPT = `You are a chat companion for Sterling, age 11. He is sharp and dislikes being talked down to, and he struggles with spelling.
 
-Every turn you return ONE JSON object only (no code fences, no text around it):
+Respond in whatever form actually fits his message — do NOT turn everything into a story:
+- If he asks a straightforward question, just answer it: clearly, accurately, plainly. No story, no whimsy.
+- If he asks for a story, or shares a drawing to build one from, then write one. Keep it grounded, not overly whimsical.
+- Otherwise, just talk with him normally, the way a knowledgeable person would.
+
+Throughout:
+- SPELLING: If his message has misspelled words, begin your reply by correcting them directly and specifically (his exact misspelling, then the correct spelling), and also list them in spellingCorrections. Don't let misspellings slide. If nothing is misspelled, use an empty array.
+- Weave in real, accurate information naturally whenever it fits — no labels, no "fun fact" framing, no quizzes. Just be substantive and honest. If you don't know something, say so.
+- Voice: accurate first, simple second. Warm but not gushing. No fake enthusiasm or piled-on praise — he notices.
+- SAFETY: keep everything appropriate for an 11-year-old — nothing violent, scary, sexual, or adult; no profanity; never ask for personal info. If he seems upset or unsafe, gently point him to a parent or trusted adult without alarming him. Don't lecture or moralize.
+
+Return ONLY one JSON object, no code fences, no text around it:
 {
   "spellingCorrections": [ { "wrong": "", "right": "" } ],
-  "storyMemory": "one sentence summarizing the whole story so far",
-  "story": "the next part of the story (about 120-200 words)",
-  "concept": { "name": "", "oneLine": "" },
-  "checkpoint": {   // null on most turns; include this object only ~once per story
-    "type": "mc" | "tf" | "open",
-    "question": "",
-    "options": ["", "", "", ""],
-    "correctAnswer": "",
-    "explanation": ""
-  }
+  "reply": "your actual response to him — an answer, a normal chat message, or a story, whatever fits",
+  "learned": "if you taught a real concept this turn, a short phrase naming it (for the parent's private records only, never shown to him); otherwise null"
+}`;
+
+const REPORT_SYSTEM = `You write a short, candid progress report for a PARENT about their 11-year-old son, based on saved data from an app he uses to chat, ask questions, learn, and make up stories. Be specific and useful, not flattering. Cover, in a few short plain paragraphs: what topics and concepts he's been exploring; how his spelling is going and any pattern in the words he misspells; his engagement (roughly how much he's done); apparent strengths; gaps or things worth reinforcing; and 2-3 concrete suggestions for what to explore next. Base everything ONLY on the data provided. If the data is thin, say so plainly rather than padding. Write to the parent, not the child.`;
+
+const strip = (t) => t.replace(/```json/gi, "").replace(/```/g, "").trim();
+const today = () => new Date().toISOString().slice(0, 10);
+
+// Cost control: only send recent history to the model, and never re-send images.
+const HISTORY_LIMIT = 12;
+function capHistory(convo) {
+  let h = convo.slice(-HISTORY_LIMIT);
+  while (h.length && h[0].role === "assistant") h = h.slice(1); // must start with a user turn
+  return h;
 }
-
-Rules:
-- SPELLING FIRST: If his message has misspelled words, list each in spellingCorrections as {wrong, right}, using his exact misspelling and the correct spelling. Correct him directly and specifically every time — do not let misspellings slide. If nothing is misspelled, use an empty array.
-- REAL LEARNING IN THE STORY: Build the story he asks for, but weave in a genuine, accurate real-world concept (science, nature, space, history, how things work, math, or language). The fantasy is the wrapper; the concept must be true. Put its name and a one-line meaning in "concept".
-- CHECKPOINT: Most turns must have "checkpoint": null — just continue the story, no question. Include an actual checkpoint only about ONCE PER STORY, at a natural pause after several segments or as the story wraps up. When you do include one, test a concept from the recent turns, rotate the type ("mc" with 4 options, "tf" with ["True","False"], or "open"), and fill correctAnswer and a short explanation so it is answerable from what you taught.
-- MEMORY: You'll be given a summary of past stories, concepts he's learned, and words he's misspelled before. Refer back naturally, don't repeat the same concept, and every few turns make the checkpoint revisit an earlier concept or re-test a word he previously misspelled.
-- VOICE: accurate first, simple second. Warm but not gushing. No fake enthusiasm, no piling on praise. Keep segments short so it moves.
-- SAFETY: appropriate for an 11-year-old — nothing violent, scary, sexual, or adult; no profanity; never ask for personal info. If he seems upset or unsafe, gently point him to a parent or trusted adult without alarming him. Don't lecture or moralize.`;
-
-const EVAL_SYSTEM = `You judge a child's open-ended answer. Given the question, the intended answer, and the child's answer, decide if the child is essentially correct or on the right track. Return ONLY JSON: {"correct": true or false, "feedback": "one or two warm, specific sentences; if the child misspelled anything, correct it directly (wrong -> right)"}.`;
+function stripImages(content) {
+  if (Array.isArray(content)) {
+    const text = content.filter((b) => b.type === "text").map((b) => b.text).join(" ");
+    const hadImage = content.some((b) => b.type === "image");
+    return (hadImage ? "[a drawing he shared] " : "") + text;
+  }
+  return content;
+}
 
 async function callClaude(messages, systemExtra = "") {
   const data = await anthropic({
@@ -47,26 +58,12 @@ async function callClaude(messages, systemExtra = "") {
   return (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
 }
 
-async function evalOpen(question, intended, child) {
-  const data = await anthropic({
-    system: EVAL_SYSTEM,
-    messages: [{ role: "user", content: `Question: ${question}\nIntended answer: ${intended}\nChild's answer: ${child}` }],
-  });
-  const raw = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
-  return JSON.parse(strip(raw));
-}
-
-const REPORT_SYSTEM = `You write a short, candid progress report for a PARENT about their 11-year-old son, based on saved data from a story-based learning app he uses. Be specific and useful, not flattering. Cover, in a few short plain paragraphs: what topics and concepts he's been learning; how his spelling is going and any pattern in the words he misspells; his engagement (roughly how much he's done); apparent strengths; gaps or things worth reinforcing; and 2-3 concrete suggestions for what to explore next. Base everything ONLY on the data provided. If the data is thin, say so plainly rather than padding. Write to the parent, not the child.`;
-
-const strip = (t) => t.replace(/```json/gi, "").replace(/```/g, "").trim();
-const today = () => new Date().toISOString().slice(0, 10);
-
-const DEFAULT_PROFILE = { concepts: [], words: [], stories: [], currentStory: "" };
+const DEFAULT_PROFILE = { concepts: [], words: [] };
 
 export default function StoryLearn() {
   const [profile, setProfile] = useState(DEFAULT_PROFILE);
-  const [convo, setConvo] = useState([]); // AI message history
-  const [blocks, setBlocks] = useState([]); // rendered turns
+  const [convo, setConvo] = useState([]); // API context (no images, capped)
+  const [blocks, setBlocks] = useState([]); // what's shown on screen
   const [input, setInput] = useState("");
   const [pendingImage, setPendingImage] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -86,7 +83,6 @@ export default function StoryLearn() {
   const profileRef = useRef(profile);
   profileRef.current = profile;
 
-  // load persisted memory
   useEffect(() => {
     (async () => {
       try {
@@ -107,50 +103,12 @@ export default function StoryLearn() {
 
   function memoryText() {
     const p = profileRef.current;
-    const stories = [...p.stories.slice(-3).map((s) => s.summary), p.currentStory].filter(Boolean);
-    const concepts = p.concepts.slice(-8).map((c) => c.name);
-    const words = p.words.slice(-8).map((w) => `${w.wrong}->${w.right}`);
+    const concepts = p.concepts.slice(-10).map((c) => c.name);
+    const words = p.words.slice(-10).map((w) => `${w.wrong}->${w.right}`);
     let out = "";
-    if (stories.length) out += `Past/current stories: ${stories.join(" | ")}\n`;
-    if (concepts.length) out += `Concepts he's learned: ${concepts.join(", ")}\n`;
-    if (words.length) out += `Words he's misspelled before (revisit sometimes): ${words.join(", ")}\n`;
+    if (concepts.length) out += `Things he's learned before: ${concepts.join(", ")}\n`;
+    if (words.length) out += `Words he's misspelled before (worth reinforcing): ${words.join(", ")}\n`;
     return out;
-  }
-
-  function openReport() {
-    setShowReport(true);
-    setReportUnlocked(false);
-    setPinEntry(""); setReportText(""); setAskText("");
-  }
-
-  function tryUnlock() {
-    if (pinEntry === profileRef.current.parentPin) setReportUnlocked(true);
-    else setPinEntry("");
-  }
-
-  async function savePin() {
-    if (!/^\d{4}$/.test(newPin)) return;
-    await saveProfile({ ...profileRef.current, parentPin: newPin });
-    setNewPin(""); setReportUnlocked(true);
-  }
-
-  async function aiReport(userPrompt) {
-    setReportBusy(true);
-    try {
-      const { parentPin, ...safe } = profileRef.current; // never send the PIN to the model
-      const data = await anthropic({
-        system: REPORT_SYSTEM,
-        messages: [{ role: "user", content: `Saved data (JSON):\n${JSON.stringify(safe)}\n\n${userPrompt}` }],
-      });
-      const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
-      setReportText(text || "No report came back — try again.");
-    } catch (e) {
-      setReportText("Couldn't generate the report — try again.");
-    } finally { setReportBusy(false); }
-  }
-
-  function copyReport() {
-    try { navigator.clipboard.writeText(reportText); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch (e) {}
   }
 
   const onPickFile = useCallback((e) => {
@@ -164,101 +122,96 @@ export default function StoryLearn() {
 
   function recordTurn(turn) {
     const p = { ...profileRef.current };
-    if (turn.storyMemory) p.currentStory = turn.storyMemory;
+    let changed = false;
     if (Array.isArray(turn.spellingCorrections) && turn.spellingCorrections.length) {
       p.words = [...p.words, ...turn.spellingCorrections.map((s) => ({ ...s, date: today() }))];
+      changed = true;
     }
-    // record every taught concept (checkpoints are now rare, so don't tie this to answering)
-    if (turn.concept && turn.concept.name &&
-        !p.concepts.some((c) => c.name.toLowerCase() === turn.concept.name.toLowerCase())) {
-      p.concepts = [...p.concepts, { name: turn.concept.name, oneLine: turn.concept.oneLine, date: today() }];
+    if (turn.learned && typeof turn.learned === "string" &&
+        !p.concepts.some((c) => c.name.toLowerCase() === turn.learned.toLowerCase())) {
+      p.concepts = [...p.concepts, { name: turn.learned, date: today() }];
+      changed = true;
     }
-    saveProfile(p);
+    if (changed) saveProfile(p);
   }
 
   async function requestTurn(userContent, displayUser) {
     setBusy(true);
-    const apiMsgs = [...convo, { role: "user", content: userContent }];
+    const history = capHistory(convo);
+    const apiMsgs = [...history, { role: "user", content: userContent }]; // image only rides on this turn
     try {
       const raw = await callClaude(apiMsgs, memoryText());
-      const turn = JSON.parse(strip(raw));
-      setConvo([...apiMsgs, { role: "assistant", content: raw }]);
-      setBlocks((b) => [...b, { turn, answered: false, correct: null, selected: null, openText: "", feedback: null, userShown: displayUser }]);
+      let turn;
+      try { turn = JSON.parse(strip(raw)); }
+      catch { turn = { reply: raw, spellingCorrections: [], learned: null }; }
+      // store a lean, image-free history so future calls stay cheap
+      const storedUser = { role: "user", content: stripImages(userContent) };
+      setConvo([...history, storedUser, { role: "assistant", content: turn.reply || raw }]);
+      setBlocks((b) => [...b, { turn, userShown: displayUser }]);
       recordTurn(turn);
     } catch (e) {
-      setBlocks((b) => [...b, { error: "That didn't come through — try sending it again." }]);
+      setBlocks((b) => [...b, { error: "Something went wrong — try sending that again." }]);
     } finally {
       setBusy(false);
     }
   }
 
-  function start() {
+  function send() {
     const text = input.trim();
     if ((!text && !pendingImage) || busy) return;
     let content;
     if (pendingImage) {
       content = [{ type: "image", source: { type: "base64", media_type: pendingImage.mediaType, data: pendingImage.b64 } }];
-      content.push({ type: "text", text: (text || "Write a story about my drawing.") + " Return ONLY the JSON object." });
+      content.push({ type: "text", text: text || "Here's my drawing." });
     } else {
-      content = text + " Return ONLY the JSON object.";
+      content = text;
     }
     const disp = { text, img: pendingImage ? pendingImage.dataURL : null };
     setInput(""); setPendingImage(null);
     requestTurn(content, disp);
   }
 
-  async function submitAnswer(idx) {
-    const block = blocks[idx];
-    const cp = block.turn.checkpoint;
-    if (!cp) return;
-
-    if (cp.type === "open") {
-      const ans = (block.openText || "").trim();
-      if (!ans) return;
-      setBusy(true);
-      try {
-        const res = await evalOpen(cp.question, cp.correctAnswer, ans);
-        updateBlock(idx, { answered: true, correct: !!res.correct, feedback: res.feedback });
-      } catch (e) {
-        updateBlock(idx, { answered: true, correct: null, feedback: "Good try. The idea we were after: " + cp.explanation });
-      } finally { setBusy(false); }
-    } else {
-      const sel = block.selected;
-      if (sel == null) return;
-      const correct = String(sel).trim().toLowerCase() === String(cp.correctAnswer).trim().toLowerCase();
-      updateBlock(idx, { answered: true, correct });
-    }
-  }
-
-  function updateBlock(idx, patch) {
-    setBlocks((b) => b.map((bl, i) => (i === idx ? { ...bl, ...patch } : bl)));
-  }
-
-  function continueStory(idx) {
-    const block = blocks[idx];
-    const cp = block.turn.checkpoint;
-    let msg;
-    if (cp) {
-      const ans = cp.type === "open" ? block.openText : block.selected;
-      const verdict = block.correct === true ? "correct" : block.correct === false ? "incorrect" : "answered";
-      msg = `My answer to "${cp.question}" was "${ans}" (${verdict}). Continue the story to the next part. Return ONLY the JSON object.`;
-    } else {
-      msg = `Continue the story to the next part. Return ONLY the JSON object.`;
-    }
-    requestTurn(msg, null);
-  }
-
-  function newStory() {
-    const p = { ...profileRef.current };
-    if (p.currentStory) { p.stories = [...p.stories, { summary: p.currentStory, date: today() }]; p.currentStory = ""; }
-    saveProfile(p);
+  function newChat() {
     setConvo([]); setBlocks([]); setInput(""); setPendingImage(null);
   }
 
-  const lastIdx = blocks.length - 1;
-  const last = blocks[lastIdx];
-  const needsAnswer = !!(last && last.turn && last.turn.checkpoint && !last.answered);
-  const gateOpen = blocks.length === 0 || (last && last.error) || !needsAnswer;
+  // ---- parent report ----
+  function openReport() {
+    setShowReport(true);
+    setReportUnlocked(false);
+    setPinEntry(""); setReportText(""); setAskText("");
+  }
+  function tryUnlock() {
+    if (pinEntry === profileRef.current.parentPin) setReportUnlocked(true);
+    else setPinEntry("");
+  }
+  async function savePin() {
+    if (!/^\d{4}$/.test(newPin)) return;
+    await saveProfile({ ...profileRef.current, parentPin: newPin });
+    setNewPin(""); setReportUnlocked(true);
+  }
+  async function aiReport(userPrompt) {
+    setReportBusy(true);
+    try {
+      const { parentPin, ...safe } = profileRef.current; // never send the PIN to the model
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          system: REPORT_SYSTEM,
+          messages: [{ role: "user", content: `Saved data (JSON):\n${JSON.stringify(safe)}\n\n${userPrompt}` }],
+        }),
+      });
+      const data = await res.json();
+      const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
+      setReportText(text || "No report came back — try again.");
+    } catch (e) {
+      setReportText("Couldn't generate the report — try again.");
+    } finally { setReportBusy(false); }
+  }
+  function copyReport() {
+    try { navigator.clipboard.writeText(reportText); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch (e) {}
+  }
 
   return (
     <div className="s-root">
@@ -273,32 +226,13 @@ export default function StoryLearn() {
         .s-scroll { flex:1; overflow-y:auto; padding:16px; }
         .s-empty { color:#9a9ca4; font-size:15px; text-align:center; margin-top:44px; line-height:1.6; }
         .usermsg { text-align:right; margin:0 0 14px; }
-        .usermsg .b { display:inline-block; background:#f0f1f3; padding:8px 12px; border-radius:12px; border-bottom-right-radius:4px; font-size:15px; max-width:80%; text-align:left; }
+        .usermsg .b { display:inline-block; background:#f0f1f3; padding:8px 12px; border-radius:12px; border-bottom-right-radius:4px; font-size:15px; max-width:80%; text-align:left; white-space:pre-wrap; }
         .usermsg img { max-width:180px; border-radius:8px; display:block; margin:0 0 6px auto; }
         .turn { margin:0 0 18px; }
         .spell { background:#fbf3ef; border:1px solid #f0d9cd; border-radius:9px; padding:9px 12px; margin-bottom:10px; font-size:14px; }
         .spell .h { font-weight:700; color:#b25a35; margin-bottom:3px; }
         .spell .w { font-weight:700; } .spell .w .x { color:#b23b3b; text-decoration:line-through; } .spell .w .r { color:#1f9d6b; }
-        .story { font-size:15.5px; line-height:1.65; margin-bottom:8px; white-space:pre-wrap; }
-        .concept { font-size:13px; color:#5a5c63; background:#f5f6f8; border-radius:7px; padding:6px 10px; margin-bottom:12px; }
-        .concept b { color:#40424a; }
-        .cp { border:1px solid #e6e6e8; border-radius:10px; padding:13px; }
-        .cp .q { font-weight:600; font-size:15px; margin-bottom:10px; }
-        .opt { display:block; width:100%; text-align:left; border:1px solid #d9dade; background:#fff; border-radius:9px; padding:9px 12px; margin-bottom:7px; font-size:14.5px; cursor:pointer; font-family:inherit; }
-        .opt:hover:not(:disabled) { background:#f6f6f8; }
-        .opt.sel { border-color:#1f2023; }
-        .opt.right { border-color:#1f9d6b; background:#eefaf3; }
-        .opt.wrong { border-color:#d98a76; background:#fcf1ee; }
-        .opt:disabled { cursor:default; }
-        textarea.open { width:100%; border:1px solid #d9dade; border-radius:9px; padding:10px; font-family:inherit; font-size:14.5px; min-height:60px; resize:vertical; }
-        textarea.open:focus { outline:none; border-color:#b0b2b8; }
-        .cpbtn { margin-top:9px; border:none; background:#1f2023; color:#fff; padding:9px 16px; border-radius:9px; font-weight:600; font-size:14px; cursor:pointer; }
-        .cpbtn:disabled { background:#c8c9cd; cursor:default; }
-        .result { margin-top:10px; font-size:14px; line-height:1.5; }
-        .result .tag { font-weight:700; }
-        .result .tag.ok { color:#1f9d6b; } .result .tag.no { color:#c0563c; }
-        .expl { color:#40424a; margin-top:3px; }
-        .locknote { color:#9a9ca4; font-size:12.5px; margin-top:8px; }
+        .reply { font-size:15.5px; line-height:1.65; white-space:pre-wrap; }
         .s-input { border-top:1px solid #ececee; padding:12px; }
         .thumb { display:inline-flex; align-items:center; gap:8px; background:#f4f4f6; border-radius:8px; padding:6px 8px; margin-bottom:8px; font-size:13px; color:#5a5c63; }
         .thumb img { width:32px; height:32px; object-fit:cover; border-radius:5px; }
@@ -311,11 +245,6 @@ export default function StoryLearn() {
         .attach:disabled { opacity:.5; cursor:default; }
         .go { border:none; background:#1f2023; color:#fff; height:44px; padding:0 18px; border-radius:10px; cursor:pointer; font-size:15px; font-weight:600; flex:none; }
         .go:disabled { background:#c8c9cd; cursor:default; }
-        .cont { border:none; background:#1f2023; color:#fff; padding:10px 16px; border-radius:10px; cursor:pointer; font-size:15px; font-weight:600; width:100%; }
-        .cont:disabled { background:#c8c9cd; }
-        .prog { padding:12px 16px; border-bottom:1px solid #ececee; background:#fafafb; font-size:13.5px; }
-        .prog h4 { margin:0 0 6px; font-size:13px; color:#40424a; }
-        .prog .list { color:#5a5c63; line-height:1.6; }
         .dots span { display:inline-block; width:6px; height:6px; margin-right:4px; background:#c2c4ca; border-radius:50%; animation:b 1.2s infinite; }
         .dots span:nth-child(2){ animation-delay:.2s;} .dots span:nth-child(3){ animation-delay:.4s;}
         @keyframes b { 0%,60%,100%{opacity:.3;} 30%{opacity:1;} }
@@ -343,21 +272,20 @@ export default function StoryLearn() {
       `}</style>
 
       <div className="s-bar">
-        <b className="s-title" onClick={openReport}>Story &amp; Learning</b>
+        <b className="s-title" onClick={openReport}>Chat</b>
         <div>
-          {blocks.length > 0 && <button onClick={newStory}>New story</button>}
+          {blocks.length > 0 && <button onClick={newChat}>New chat</button>}
         </div>
       </div>
 
       <div className="s-scroll" ref={scrollRef}>
         {blocks.length === 0 && !busy && (
-          <div className="s-empty">Tell it what the story should be about,<br />or attach a drawing to start.</div>
+          <div className="s-empty">Ask a question, upload a drawing,<br />or ask for a story.</div>
         )}
 
         {blocks.map((bl, idx) => {
           if (bl.error) return <div className="turn" key={idx} style={{ color: "#c0563c" }}>{bl.error}</div>;
-          const t = bl.turn, cp = t.checkpoint;
-          const isLast = idx === lastIdx;
+          const t = bl.turn;
           return (
             <div key={idx}>
               {bl.userShown && (bl.userShown.text || bl.userShown.img) && (
@@ -375,57 +303,7 @@ export default function StoryLearn() {
                     ))}
                   </div>
                 )}
-                <div className="story">{t.story}</div>
-                {t.concept && t.concept.name && (
-                  <div className="concept"><b>{t.concept.name}</b> — {t.concept.oneLine}</div>
-                )}
-
-                {cp && (
-                  <div className="cp">
-                    <div className="q">{cp.question}</div>
-
-                    {cp.type !== "open" && (cp.options || []).map((opt, oi) => {
-                      let cls = "opt";
-                      if (bl.answered) {
-                        if (String(opt).toLowerCase() === String(cp.correctAnswer).toLowerCase()) cls += " right";
-                        else if (bl.selected === opt) cls += " wrong";
-                      } else if (bl.selected === opt) cls += " sel";
-                      return (
-                        <button key={oi} className={cls} disabled={bl.answered || busy}
-                          onClick={() => updateBlock(idx, { selected: opt })}>{opt}</button>
-                      );
-                    })}
-
-                    {cp.type === "open" && (
-                      <textarea className="open" placeholder="Type your answer" value={bl.openText}
-                        disabled={bl.answered || busy}
-                        onChange={(e) => updateBlock(idx, { openText: e.target.value })} />
-                    )}
-
-                    {!bl.answered && (
-                      <button className="cpbtn" disabled={busy || (cp.type === "open" ? !bl.openText.trim() : bl.selected == null)}
-                        onClick={() => submitAnswer(idx)}>Check answer</button>
-                    )}
-
-                    {bl.answered && (
-                      <div className="result">
-                        <span className={"tag " + (bl.correct ? "ok" : "no")}>{bl.correct ? "Correct." : "Not quite."}</span>
-                        <div className="expl">{cp.type === "open" ? bl.feedback : cp.explanation}</div>
-                        {cp.type !== "open" && !bl.correct && (
-                          <div className="expl">Answer: <b>{cp.correctAnswer}</b></div>
-                        )}
-                      </div>
-                    )}
-
-                    {!bl.answered && <div className="locknote">Answer this to keep going.</div>}
-                  </div>
-                )}
-
-                {isLast && !busy && (!cp || bl.answered) && (
-                  <div style={{ marginTop: 12 }}>
-                    <button className="cont" disabled={busy} onClick={() => continueStory(idx)}>Continue</button>
-                  </div>
-                )}
+                <div className="reply">{t.reply}</div>
               </div>
             </div>
           );
@@ -444,12 +322,12 @@ export default function StoryLearn() {
         )}
         <div className="inrow">
           <input ref={fileRef} type="file" accept="image/*" onChange={onPickFile} style={{ display: "none" }} />
-          <button className="attach" disabled={!gateOpen || busy} onClick={() => fileRef.current && fileRef.current.click()} title="Attach a drawing">＋</button>
-          <textarea className="ta" placeholder={gateOpen ? "What should the story be about?" : "Answer the question above to continue"}
-            value={input} disabled={!gateOpen || busy}
+          <button className="attach" disabled={busy} onClick={() => fileRef.current && fileRef.current.click()} title="Attach a drawing">＋</button>
+          <textarea className="ta" placeholder="Message"
+            value={input} disabled={busy}
             onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); start(); } }} rows={1} />
-          <button className="go" disabled={!gateOpen || busy || (!input.trim() && !pendingImage)} onClick={start}>Send</button>
+            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }} rows={1} />
+          <button className="go" disabled={busy || (!input.trim() && !pendingImage)} onClick={send}>Send</button>
         </div>
       </div>
 
@@ -489,7 +367,6 @@ export default function StoryLearn() {
                 <div className="rp-stats">
                   <div className="stat"><div className="n">{profile.concepts.length}</div><div className="l">concepts</div></div>
                   <div className="stat"><div className="n">{profile.words.length}</div><div className="l">words fixed</div></div>
-                  <div className="stat"><div className="n">{profile.stories.length}</div><div className="l">stories done</div></div>
                 </div>
 
                 <button className="rp-btn" disabled={reportBusy} onClick={() => aiReport("Write the progress report.")}>
@@ -516,7 +393,7 @@ export default function StoryLearn() {
                 <details style={{ marginTop: 16 }}>
                   <summary style={{ cursor: "pointer", fontSize: 13, color: "#6a6c73" }}>Raw records</summary>
                   <div style={{ marginTop: 8 }}>
-                    <div style={{ fontSize: 12.5, fontWeight: 700, color: "#40424a" }}>Concepts learned</div>
+                    <div style={{ fontSize: 12.5, fontWeight: 700, color: "#40424a" }}>Things he's learned</div>
                     <div style={{ fontSize: 13.5, color: "#5a5c63", lineHeight: 1.6 }}>{profile.concepts.length ? profile.concepts.map((c) => c.name).join(" · ") : "None yet."}</div>
                     <div style={{ fontSize: 12.5, fontWeight: 700, color: "#40424a", marginTop: 8 }}>Words corrected</div>
                     <div style={{ fontSize: 13.5, color: "#5a5c63", lineHeight: 1.6 }}>{profile.words.length ? profile.words.map((w) => `${w.wrong}→${w.right}`).join(" · ") : "None yet."}</div>
@@ -524,7 +401,7 @@ export default function StoryLearn() {
                 </details>
 
                 <div className="rp-note">
-                  This report is generated from what's been saved on this device. It reflects the app's records, not a formal assessment.
+                  This report is generated from what's been saved. It reflects the app's records, not a formal assessment.
                 </div>
               </div>
             )}
