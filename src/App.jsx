@@ -54,15 +54,20 @@ function stripImages(content) {
 // Keep only the last N chats; older ones are evicted (and their data deleted).
 const MAX_CHATS = 50;
 
-// Saved chats keep a small thumbnail instead of the full-size drawing.
-const THUMB_MAX = 160; // px on the long edge
-function makeThumb(dataURL) {
+// Anthropic resizes anything larger than 1568px on the long edge anyway, so sending
+// full-res costs latency + can blow the 5MB/image and Vercel ~4.5MB body limits for
+// zero benefit. Downscale on upload. Re-encoding to JPEG also normalizes HEIC.
+const API_MAX_EDGE = 1568;
+const THUMB_MAX = 160; // px on the long edge, for saved chats
+const MAX_B64_BYTES = 4_000_000; // stay well under both limits
+
+function resizeDataURL(dataURL, maxEdge, quality) {
   return new Promise((resolve) => {
     try {
       const img = new Image();
       img.onload = () => {
         try {
-          const scale = Math.min(1, THUMB_MAX / Math.max(img.width, img.height));
+          const scale = Math.min(1, maxEdge / Math.max(img.width, img.height));
           const w = Math.max(1, Math.round(img.width * scale));
           const h = Math.max(1, Math.round(img.height * scale));
           const c = document.createElement("canvas");
@@ -71,7 +76,7 @@ function makeThumb(dataURL) {
           ctx.fillStyle = "#fff";
           ctx.fillRect(0, 0, w, h); // flatten transparency for JPEG
           ctx.drawImage(img, 0, 0, w, h);
-          resolve(c.toDataURL("image/jpeg", 0.6));
+          resolve(c.toDataURL("image/jpeg", quality));
         } catch (e) { resolve(null); }
       };
       img.onerror = () => resolve(null);
@@ -79,6 +84,7 @@ function makeThumb(dataURL) {
     } catch (e) { resolve(null); }
   });
 }
+const makeThumb = (dataURL) => resizeDataURL(dataURL, THUMB_MAX, 0.6);
 
 // Persist a thumbnail (not the full base64 image) so storage stays small.
 function slimBlocks(blks) {
@@ -109,6 +115,8 @@ export default function StoryLearn() {
   const [blocks, setBlocks] = useState([]);
   const [input, setInput] = useState("");
   const [pendingImage, setPendingImage] = useState(null);
+  const [preparing, setPreparing] = useState(false);
+  const [imgErr, setImgErr] = useState(null);
   const [busy, setBusy] = useState(false);
 
   // chats
@@ -167,11 +175,26 @@ export default function StoryLearn() {
 
   const onPickFile = useCallback((e) => {
     const file = e.target.files && e.target.files[0];
-    if (!file || !file.type.startsWith("image/")) return;
-    const reader = new FileReader();
-    reader.onload = () => setPendingImage({ dataURL: reader.result, b64: String(reader.result).split(",")[1], mediaType: file.type });
-    reader.readAsDataURL(file);
     if (fileRef.current) fileRef.current.value = "";
+    if (!file || !file.type.startsWith("image/")) return;
+    setImgErr(null);
+    setPreparing(true);
+    const reader = new FileReader();
+    reader.onload = async () => {
+      // Shrink before it goes anywhere: a phone/tablet photo is far too big to send raw.
+      const small = await resizeDataURL(reader.result, API_MAX_EDGE, 0.85);
+      const url = small || reader.result;
+      const b64 = String(url).split(",")[1] || "";
+      if (b64.length > MAX_B64_BYTES) {
+        setImgErr("That picture is too big to send. Try a smaller photo.");
+        setPreparing(false);
+        return;
+      }
+      setPendingImage({ dataURL: url, b64, mediaType: small ? "image/jpeg" : file.type });
+      setPreparing(false);
+    };
+    reader.onerror = () => { setImgErr("Couldn't read that picture."); setPreparing(false); };
+    reader.readAsDataURL(file);
   }, []);
 
   function recordTurn(turn) {
@@ -233,7 +256,10 @@ export default function StoryLearn() {
       touchChat(id, isNew ? title : undefined);
       persistChat(id, nextBlocks, nextConvo);
     } catch (e) {
-      setBlocks((b) => [...b, { error: "Something went wrong — try sending that again." }]);
+      const msg = e && e.message ? String(e.message) : "";
+      setBlocks((b) => [...b, { error: msg.includes("413") || msg.includes("too large")
+        ? "That picture was too big to send. Try a smaller one."
+        : "Something went wrong — try sending that again." }]);
     } finally {
       setBusy(false);
     }
@@ -363,6 +389,8 @@ export default function StoryLearn() {
         .spell .w { font-weight:700; } .spell .w .x { color:#b23b3b; text-decoration:line-through; } .spell .w .r { color:#1f9d6b; }
         .reply { font-size:15.5px; line-height:1.65; white-space:pre-wrap; }
         .s-input { border-top:1px solid #ececee; padding:12px; }
+        .imgerr { background:#fcf1ee; border:1px solid #f0d9cd; color:#b23b3b; border-radius:8px; padding:8px 10px; margin-bottom:8px; font-size:13px; font-weight:600; }
+        .imgprep { color:#9a9ca4; font-size:13px; margin-bottom:8px; }
         .thumb { display:inline-flex; align-items:center; gap:8px; background:#f4f4f6; border-radius:8px; padding:6px 8px; margin-bottom:8px; font-size:13px; color:#5a5c63; }
         .thumb img { width:32px; height:32px; object-fit:cover; border-radius:5px; }
         .thumb button { border:none; background:none; color:#8a8c93; cursor:pointer; }
@@ -467,21 +495,23 @@ export default function StoryLearn() {
         </div>
 
         <div className="s-input">
+          {imgErr && <div className="imgerr">{imgErr}</div>}
+          {preparing && <div className="imgprep">Getting your picture ready…</div>}
           {pendingImage && (
             <div className="thumb">
               <img src={pendingImage.dataURL} alt="attached" />
               <span>Drawing attached</span>
-              <button onClick={() => setPendingImage(null)}>✕</button>
+              <button onClick={() => { setPendingImage(null); setImgErr(null); }}>✕</button>
             </div>
           )}
           <div className="inrow">
             <input ref={fileRef} type="file" accept="image/*" onChange={onPickFile} style={{ display: "none" }} />
-            <button className="attach" disabled={busy} onClick={() => fileRef.current && fileRef.current.click()} title="Attach a drawing">＋</button>
+            <button className="attach" disabled={busy || preparing} onClick={() => fileRef.current && fileRef.current.click()} title="Attach a drawing">＋</button>
             <textarea className="ta" placeholder="Message"
               value={input} disabled={busy}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }} rows={1} />
-            <button className="go" disabled={busy || (!input.trim() && !pendingImage)} onClick={send}>Send</button>
+            <button className="go" disabled={busy || preparing || (!input.trim() && !pendingImage)} onClick={send}>Send</button>
           </div>
         </div>
       </div>
